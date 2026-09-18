@@ -1,0 +1,142 @@
+%%cuda
+#include <iostream>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+#define MAX_DEPTH 16 // Prevent infinite hardware nesting stack overflows
+
+// Helper function to swap elements on the GPU device
+__device__ void gpu_swap(int& a, int& b) {
+    int temp = a;
+    a = b;
+    b = temp;
+}
+
+// Device Partition function used by both implementations
+__device__ int gpu_partition(int* data, int left, int right) {
+    int pivot = data[right];
+    int i = left - 1;
+    for (int j = left; j < right; j++) {
+        if (data[j] <= pivot) {
+            i++;
+            gpu_swap(data[i], data[j]);
+        }
+    }
+    gpu_swap(data[i + 1], data[right]);
+    return i + 1;
+}
+
+// -------------------------------------------------------------
+// 1. SERIAL QUICK SORT KERNEL (Runs on 1 single thread)
+// -------------------------------------------------------------
+__device__ void serial_quicksort_recursive(int* data, int left, int right) {
+    if (left < right) {
+        int pivot_idx = gpu_partition(data, left, right);
+        serial_quicksort_recursive(data, left, pivot_idx - 1);
+        serial_quicksort_recursive(data, pivot_idx + 1, right);
+    }
+}
+
+__global__ void serial_quicksort_kernel(int* data, int n) {
+    // Only the very first thread of the grid does the entire work
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        serial_quicksort_recursive(data, 0, n - 1);
+    }
+}
+
+// -------------------------------------------------------------
+// 2. PARALLEL QUICK SORT KERNEL (Uses CUDA Dynamic Parallelism)
+// -------------------------------------------------------------
+__global__ void parallel_quicksort_kernel(int* data, int left, int right, int depth) {
+    if (left >= right) return;
+
+    // The single master thread of this specific block handles partitioning
+    int pivot_idx = gpu_partition(data, left, right);
+
+    // If we haven't exceeded maximum hardware depth, spawn child grids in parallel
+    if (depth < MAX_DEPTH) {
+        // Launch a new grid of 1 block/1 thread for the left side
+        cudaStream_t s1;
+        cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking);
+        parallel_quicksort_kernel<<<1, 1, 0, s1>>>(data, left, pivot_idx - 1, depth + 1);
+        cudaStreamDestroy(s1);
+
+        // Launch a new grid of 1 block/1 thread for the right side
+        cudaStream_t s2;
+        cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
+        parallel_quicksort_kernel<<<1, 1, 0, s2>>>(data, pivot_idx + 1, right, depth + 1);
+        cudaStreamDestroy(s2);
+    } else {
+        // Fall back to sequential execution if hardware nesting depth is hit
+        serial_quicksort_recursive(data, left, pivot_idx - 1);
+        serial_quicksort_recursive(data, pivot_idx + 1, right);
+    }
+}
+
+// -------------------------------------------------------------
+// MAIN DRIVER (Runs on Host CPU)
+// -------------------------------------------------------------
+int main() {
+    const int N = 5000; // Array Size
+    size_t size = N * sizeof(int);
+
+    // Initialize Host Array with Reverse Sorted Values (Worst Case Scenario)
+    int* h_data = (int*)malloc(size);
+    for (int i = 0; i < N; i++) {
+        h_data[i] = N - i;
+    }
+
+    // Allocate Device memory for both test environments
+    int *d_serial_data, *d_parallel_data;
+    cudaMalloc(&d_serial_data, size);
+    cudaMalloc(&d_parallel_data, size);
+
+    cudaMemcpy(d_serial_data, h_data, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_parallel_data, h_data, size, cudaMemcpyHostToDevice);
+
+    // CUDA events for precise timing measurement
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float milliseconds = 0;
+
+    std::cout << "Sorting array of size: " << N << "\n\n";
+
+    // --- Benchmark Serial Quicksort ---
+    cudaEventRecord(start);
+    serial_quicksort_kernel<<<1, 1>>>(d_serial_data, N);
+    cudaEventRecord(stop);
+    cudaDeviceSynchronize();
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    std::cout << "Serial GPU Quicksort Time  : " << milliseconds << " ms\n";
+
+    // --- Benchmark Parallel Quicksort ---
+    // Increase system limits to accommodate Dynamic Parallelism call stack depth
+    cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, MAX_DEPTH);
+
+    cudaEventRecord(start);
+    parallel_quicksort_kernel<<<1, 1>>>(d_parallel_data, 0, N - 1, 0);
+    cudaEventRecord(stop);
+    cudaDeviceSynchronize();
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    std::cout << "Parallel GPU Quicksort Time: " << milliseconds << " ms\n";
+
+    // Verify parallel results to ensure validity
+    int* h_result = (int*)malloc(size);
+    cudaMemcpy(h_result, d_parallel_data, size, cudaMemcpyDeviceToHost);
+    bool success = true;
+    for (int i = 0; i < N - 1; i++) {
+        if (h_result[i] > h_result[i+1]) {
+            success = false;
+            break;
+        }
+    }
+    std::cout << "\nValidation Check: " << (success ? "PASSED ✅" : "FAILED ❌") << "\n";
+
+    // Cleanup resources
+    free(h_data); free(h_result);
+    cudaFree(d_serial_data); cudaFree(d_parallel_data);
+    cudaEventDestroy(start); cudaEventDestroy(stop);
+
+    return 0;
+}
