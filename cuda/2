@@ -1,0 +1,44 @@
+serial
+void quickSortSerial(int *arr, int low, int high) {
+    if (low < high) {
+        int pivot = arr[high];
+        int i = (low - 1);
+        for (int j = low; j <= high - 1; j++) {
+            if (arr[j] < pivot) {
+                i++;
+                int temp = arr[i]; arr[i] = arr[j]; arr[j] = temp;
+            }
+        }
+        int temp = arr[i + 1]; arr[i + 1] = arr[high]; arr[high] = temp;
+        int pi = i + 1;
+        
+        quickSortSerial(arr, low, pi - 1);
+        quickSortSerial(arr, pi + 1, high);
+    }
+}
+
+
+parallel
+__global__ void cdp_quicksort(unsigned int *data, int left, int right, int depth) {
+    if (left >= right || depth > 16) return;
+    
+    // Partition step (simplified pivot arrangement)
+    unsigned int pivot = data[right];
+    int i = left - 1;
+    for (int j = left; j < right; j++) {
+        if (data[j] <= pivot) {
+            i++;
+            unsigned int t = data[i]; data[i] = data[j]; data[j] = t;
+        }
+    }
+    unsigned int t = data[i + 1]; data[i + 1] = data[right]; data[right] = t;
+    int p = i + 1;
+
+    // Launch child kernels recursively from the GPU if depth permits
+    if (left < p) {
+        cdp_quicksort<<<1, 1>>>(data, left, p - 1, depth + 1);
+    }
+    if (p < right) {
+        cdp_quicksort<<<1, 1>>>(data, p + 1, right, depth + 1);
+    }
+}
